@@ -43,15 +43,64 @@ caseMap = {
 	"insensitive": eEPGCache.NO_CASE_CHECK
 }
 
-class AutoTimerIgnoreTimerException(Exception):
-	def __init__(self, cause):
-		self.cause = cause
-
+class AutoTimerNormalizedEvent:
+	"""Class for event normalization
+	
+	This class is used to represent timers, movies and epg events.
+	All objects of this class can easily be compared using the equal operator.
+	"""
+	
+	def __init__(self, name, shortDescription, extendedDescription):
+		"""Constructor
+		
+		Initialize the attributes of the object. 
+		"""
+		self.name = name
+		self.shortDescription = shortDescription
+		self.extendedDescription = extendedDescription
+		
 	def __str__(self):
-		return "[AutoTimer] " + str(self.cause)
+		"""Convert object to string
+		
+		Useful for debugging purposes... 
+		"""
+		return str({
+			'name': self.name,
+			'shortDescription': self.shortDescription,
+			'extendedDescription': self.extendedDescription
+		})
+	
+	def __eq__(self, other):
+		"""Compare two events
+		
+		If comparison can not be performed based on the name and the short description,
+		we use the jaccard index of the extended descriptions.
+		"""
+		if not isinstance(other, AutoTimerNormalizedEvent):
+			return false
+		if self.name != other.name:
+			return False
+		if ('' == self.shortDescription or self.shortDescription == self.name) \
+			and ('' == other.shortDescription or other.shortDescription == other.name):
+			# Compare extended description
+			return self.jaccardIndex(self.getWordsOfExtendedDescription(), other.getWordsOfExtendedDescription()) >= 0.9
+		else:
+			# Compare short description
+			if self.shortDescription == other.shortDescription:
+				return True 
+		return False
+	
+	def getWordsOfExtendedDescription(self):
+		"""Get a set with all words in the extended description.
+		"""
+		return set(self.extendedDescription.split(" "))
 
-	def __repr__(self):
-		return str(type(self))
+	def jaccardIndex(self, words1, words2):
+		"""Calculate the jaccard index of to sets of words
+		
+		http://en.wikipedia.org/wiki/Jaccard_index
+		"""
+		return float(len(words1 & words2)) / float(len(words1 | words2))
 
 class AutoTimer:
 	"""Read and save xml configuration, query EPGCache"""
@@ -67,6 +116,12 @@ class AutoTimer:
 			"",		# Match
 			True 	# Enabled
 		)
+		self.epgcache = eEPGCache.getInstance()
+		# Create dict of all movies in all folders used by an autotimer to compare with recordings
+		self.serviceHandler = eServiceCenter.getInstance()
+		self.moviedict = {}
+		self.normalizedTimers = {}
+		print "[AutoTimer] init ..."
 
 # Configuration
 
@@ -150,6 +205,100 @@ class AutoTimer:
 			idx += 1
 		self.timers.append(timer)
 
+	def normalizeEvent(self, event):
+		"""Normalize an epg event
+		
+		Transform an epg event to an AutoTimerNormalizedEvent.
+		"""
+		return AutoTimerNormalizedEvent(
+			event.getEventName(),
+			event.getShortDescription(),
+			event.getExtendedDescription()
+		)
+			
+	def normalizeRecordTimer(self, timer):
+		"""Normalize a record timer
+		
+		Transform a record timer to an AutoTimerNormalizedEvent.
+		"""
+		key = str(timer.service_ref) + str(timer.eit)
+		if key in self.normalizedTimers:
+			return self.normalizedTimers[key]
+		
+		extendedDescription = ""
+		# Fetch extended description from EPG.
+		# Will only work for timers in the future.
+		if timer.eit is not None:
+			event = self.epgcache.lookupEvent(['EX', ("%s" % timer.service_ref , 2, timer.eit)])
+			if event and event[0][0] is not None:
+				extendedDescription = event[0][0]
+		
+		result = AutoTimerNormalizedEvent(
+			timer.name,
+			timer.description,
+			extendedDescription
+		)
+		
+		self.normalizedTimers[key] = result
+		return result
+
+	def normalizeMovieRef(self, movieRef, serviceRef):
+		"""Normalize a recorded movie
+		
+		Transform a movie to an AutoTimerNormalizedEvent.
+		"""
+		info = self.serviceHandler.info(movieRef)
+		if info is None:
+			return {}
+		event = info.getEvent(movieRef)
+		
+		result = AutoTimerNormalizedEvent(
+			info.getName(movieRef),
+			info.getInfoString(serviceRef, iServiceInformation.sDescription),
+			event and event.getExtendedDescription() or ""
+		)
+		
+		return result
+
+	def isEventInList(self, event, list, normalizeCallback = None):
+		"""Check if a normalized event is similar to an event in a list
+		
+		If the list does not contain normalized events, the normalizeCallback must provide
+		a function to use to normalize the events.
+		"""
+		# Parse sequences of entries
+		for entry in list:
+			if isinstance(list, dict):
+				entry = list[entry]
+			if normalizeCallback is not None:
+				entry = normalizeCallback(entry)
+			if entry == event:
+				return True
+		return False
+	
+	def checkMovies(self, eventInfo, directory):
+		"""Check if an event is similar to a recorded movie in a directory
+		"""
+		# Eventually create cache
+		if directory and directory not in self.moviedict:
+			serviceRef = eServiceReference("2:0:1:0:0:0:0:0:0:0:" + directory)
+			movielist = self.serviceHandler.list(serviceRef)
+			if movielist is None:
+				print "[AutoTimer] Listing of movies in " + directory + " failed"
+			else:
+				self.moviedict.setdefault(directory, [])
+				append = self.moviedict[directory].append
+				while 1:
+					movieRef = movielist.getNext()
+					if not movieRef.valid():
+						break
+					if movieRef.flags & eServiceReference.mustDescent:
+						continue
+					append(self.normalizeMovieRef(movieRef, serviceRef))
+				del append
+				
+		return self.isEventInList(eventInfo, self.moviedict.get(directory, []))
+
 # Main function
 
 	def parseEPG(self, simulateOnly = False):
@@ -174,12 +323,9 @@ class AutoTimer:
 		# Save Recordings in a dict to speed things up a little
 		# We include processed timers as we might search for duplicate descriptions
 		recorddict = {}
-		for timer in NavigationInstance.instance.RecordTimer.timer_list + NavigationInstance.instance.RecordTimer.processed_timers:
-			recorddict.setdefault(str(timer.service_ref), []).append(timer)
-
-		# Create dict of all movies in all folders used by an autotimer to compare with recordings
-		moviedict = {}
-		serviceHandler = eServiceCenter.getInstance()
+		for rtimer in NavigationInstance.instance.RecordTimer.timer_list + NavigationInstance.instance.RecordTimer.processed_timers:
+			if not rtimer.disabled:
+				recorddict.setdefault(str(rtimer.service_ref), []).append(rtimer)
 
 		# Iterate Timer
 		for timer in self.getEnabledTimerList():
@@ -195,13 +341,12 @@ class AutoTimer:
 					pass
 
 			# Search EPG, default to empty list
-			epgcache = eEPGCache.getInstance()
-			ret = epgcache.search(('RI', 500, typeMap[timer.searchType], match, caseMap[timer.searchCase])) or ()
+			ret = self.epgcache.search(('RI', 500, typeMap[timer.searchType], match, caseMap[timer.searchCase])) or ()
 
 			for serviceref, eit in ret:
 				eserviceref = eServiceReference(serviceref)
 
-				evt = epgcache.lookupEventId(eserviceref, eit)
+				evt = self.epgcache.lookupEventId(eserviceref, eit)
 				if not evt:
 					print "[AutoTimer] Could not create Event!"
 					continue
@@ -213,8 +358,7 @@ class AutoTimer:
 					serviceref = i.toString()
 
 				# Gather Information
-				name = evt.getEventName()
-				description = evt.getShortDescription()
+				evtInfo = self.normalizeEvent(evt)
 				evtBegin = begin = evt.getBeginTime()
 				duration = evt.getDuration()
 				evtEnd = end = begin + duration
@@ -240,8 +384,12 @@ class AutoTimer:
 					or timer.checkDuration(duration) \
 					or timer.checkTimespan(timestamp) \
 					or timer.checkTimeframe(begin) \
-					or timer.checkFilter(name, description,
-						evt.getExtendedDescription(), str(timestamp.tm_wday)):
+					or timer.checkFilter(
+							evtInfo.name,
+							evtInfo.shortDescription,
+							evtInfo.extendedDescription,
+							str(timestamp.tm_wday)
+						):
 					continue
 
 				if timer.hasOffset():
@@ -259,49 +407,14 @@ class AutoTimer:
 				total += 1
 
 				# Append to timerlist and abort if simulating
-				timers.append((name, begin, end, serviceref, timer.name))
+				timers.append((evtInfo.name, begin, end, serviceref, timer.name))
 				if simulateOnly:
 					continue
 
 
-				# Check for existing recordings in directory
-				if timer.avoidDuplicateDescription == 3:
-					# Reset movie Exists
-					movieExists = False
-
-					# Eventually create cache
-					if dest and dest not in moviedict:
-						movielist = serviceHandler.list(eServiceReference("2:0:1:0:0:0:0:0:0:0:" + dest))
-						if movielist is None:
-							print "[AutoTimer] listing of movies in " + dest + " failed"
-						else:
-							moviedict[dest] = []
-							append = moviedict[dest].append
-							while 1:
-								movieref = movielist.getNext()
-								if not movieref.valid():
-									break
-								if movieref.flags & eServiceReference.mustDescent:
-									continue
-								info = serviceHandler.info(movieref)
-								if info is None:
-									continue
-								append({
-									"name": info.getName(movieref),
-									"description": info.getInfoString(movieref, iServiceInformation.sDescription)
-								})
-							del append
-
-					for movieinfo in moviedict.get(dest, ()):
-						moviename = movieinfo.get("name")
-						moviedescription = movieinfo.get("description")
-						if moviename == name and moviedescription == description:
-							print "[AutoTimer] We found a matching recorded movie, skipping event:", name
-							movieExists = True
-							break
-
-					if movieExists:
-						continue
+                # Check for existing recordings in directory
+				if timer.avoidDuplicateDescription == 3 and self.checkMovies(evtInfo, dest):
+					continue
 
 				# Initialize
 				newEntry = None
@@ -311,12 +424,15 @@ class AutoTimer:
 				# We first check eit and if user wants us to guess event based on time
 				# we try this as backup. The allowed diff should be configurable though.
 				for rtimer in recorddict.get(serviceref, ()):
-					if rtimer.eit == eit or config.plugins.autotimer.try_guessing.value and getTimeDiff(rtimer, evtBegin, evtEnd) > ((duration/10)*8):
+					if rtimer.eit == eit or config.plugins.autotimer.try_guessing.value and getTimeDiff(rtimer, begin, end) > ((duration/10)*8):
 						oldExists = True
 
 						# Abort if we don't want to modify timers or timer is repeated
-						if config.plugins.autotimer.refresh.value == "none" or rtimer.repeated:
-							print "[AutoTimer] Won't modify existing timer because either no modification allowed or repeated timer"
+						if config.plugins.autotimer.refresh.value == "none":
+							print "[AutoTimer] Won't modify existing timer because no modification allowed"
+							break
+						if rtimer.repeated:
+							print "[AutoTimer] Won't modify existing timer because repeated timer"
 							break
 
 						if hasattr(rtimer, "isAutoTimer"):
@@ -332,16 +448,16 @@ class AutoTimer:
 						modified += 1
 
 						# Modify values saved in timer
-						newEntry.name = name
-						newEntry.description = description
+						newEntry.name = evtInfo.name
+						newEntry.description = evtInfo.shortDescription
 						newEntry.begin = int(begin)
 						newEntry.end = int(end)
 						newEntry.service_ref = ServiceReference(serviceref)
 
 						break
-					elif timer.avoidDuplicateDescription >= 1 and not rtimer.disabled and rtimer.name == name and rtimer.description == description:
+					elif timer.avoidDuplicateDescription >= 1 and self.normalizeRecordTimer(rtimer) == evtInfo:
 						oldExists = True
-						print "[AutoTimer] We found a timer with same description, skipping event"
+						print "[AutoTimer] We found a timer with same service and description, skipping event"
 						break
 
 				# We found no timer we want to edit
@@ -351,34 +467,27 @@ class AutoTimer:
 						continue
 
 					# We want to search for possible doubles
-					if timer.avoidDuplicateDescription >= 2:
-						# I thinks thats the fastest way to do this, though it's a little ugly
-						try:
-							for list in recorddict.values():
-								for rtimer in list:
-									if not rtimer.disabled and rtimer.name == name and rtimer.description == description:
-										raise AutoTimerIgnoreTimerException("We found a timer with same description, skipping event")
-						except AutoTimerIgnoreTimerException, etite:
-							print etite
-							continue
+					if timer.avoidDuplicateDescription >= 2 and self.isEventInList(evtInfo, recorddict, self.normalizeRecordTimer):
+						print "[AutoTimer] We found a timer with same description, skipping event"
+						continue
 
 					if timer.checkCounter(timestamp):
 						print "[AutoTimer] Not adding new timer because counter is depleted."
 						continue
 
-					newEntry = RecordTimerEntry(ServiceReference(serviceref), begin, end, name, description, eit)
+					newEntry = RecordTimerEntry(ServiceReference(serviceref), begin, end, evtInfo.name, evtInfo.shortDescription, eit)
 					newEntry.log(500, "[AutoTimer] Adding new timer based on AutoTimer %s." % (timer.name,))
 
 					# Mark this entry as AutoTimer (only AutoTimers will have this Attribute set)
 					newEntry.isAutoTimer = True
 
 				# Apply afterEvent
- 				if timer.hasAfterEvent():
- 					afterEvent = timer.getAfterEventTimespan(localtime(end))
- 					if afterEvent is None:
- 						afterEvent = timer.getAfterEvent()
- 					if afterEvent is not None:
- 						newEntry.afterEvent = afterEvent
+				if timer.hasAfterEvent():
+					afterEvent = timer.getAfterEventTimespan(localtime(end))
+					if afterEvent is None:
+						afterEvent = timer.getAfterEvent()
+					if afterEvent is not None:
+						newEntry.afterEvent = afterEvent
 
 				newEntry.dirname = timer.destination
 				newEntry.justplay = timer.justplay
@@ -398,13 +507,12 @@ class AutoTimer:
 						newEntry.disabled = True
 						# We might want to do the sanity check locally so we don't run it twice - but I consider this workaround a hack anyway
 						conflicts = NavigationInstance.instance.RecordTimer.record(newEntry)
-						conflicting.append((name, begin, end, serviceref, timer.name))
+						conflicting.append((evtInfo.name, begin, end, serviceref, timer.name))
 					if conflicts is None:
 						timer.decrementCounter()
 						new += 1
 						recorddict.setdefault(serviceref, []).append(newEntry)
 					else:
-						conflicting.append((name, begin, end, serviceref, timer.name))
+						conflicting.append((evtInfo.name, begin, end, serviceref, timer.name))
 
 		return (total, new, modified, timers, conflicting)
-
