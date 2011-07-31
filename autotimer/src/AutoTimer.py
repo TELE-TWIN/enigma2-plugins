@@ -260,20 +260,24 @@ class AutoTimer:
 		
 		return result
 
-	def isEventInList(self, event, list, normalizeCallback = None):
+	def isEventInList(self, event, eventList, normalizeCallback = None):
 		"""Check if a normalized event is similar to an event in a list
 		
 		If the list does not contain normalized events, the normalizeCallback must provide
 		a function to use to normalize the events.
 		"""
 		# Parse sequences of entries
-		for entry in list:
-			if isinstance(list, dict):
-				entry = list[entry]
-			if normalizeCallback is not None:
-				entry = normalizeCallback(entry)
-			if entry == event:
-				return True
+		for entry in eventList:
+			if isinstance(eventList, dict):
+				entry = eventList[entry]
+			if isinstance(entry, list):
+				if self.isEventInList(event, entry, normalizeCallback):
+					return True
+			else:
+				if normalizeCallback is not None:
+					entry = normalizeCallback(entry)
+				if entry == event:
+					return True
 		return False
 	
 	def checkMovies(self, eventInfo, directory):
